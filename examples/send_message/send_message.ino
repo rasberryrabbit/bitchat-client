@@ -1,103 +1,72 @@
 /*
- * send_message.ino - bitchat-client 라이브러리 예제 1
+ * send_message.ino - bitchat-client 라이브러리 예제 (실제 bitchat 프로토콜)
  *
- * 한국어:
- *   가장 간단한 예제 - bitchat relay에 연결 후 5초마다 메시지 송신.
- *   Serial Monitor로 진행 상황 확인.
- *
- *   회로:
- *     - ESP32 (classic/C3/S3) 보드 + USB serial
- *     - bitchat-esp32-relay 펌웨어가 올라간 다른 ESP32 보드가 근처에 있어야 함
- *
- *   시리얼 모니터:
- *     baud 115200
- *     "Enter message: " 표시되면 텍스트 입력 + Enter
+ * 흐름:
+ *   1. 자체 Ed25519 키쌍 초기화 (NVS 영속화)
+ *   2. bitchat relay에 BLE 연결 (Service UUID f47b5e2d-...)
+ *   3. ANNOUNCE 전송 (nickname + Ed25519 pk, 서명 포함)
+ *   4. Serial 입력 → MESSAGE 전송 (서명 + PKCS#7 패딩)
+ *   5. relay에서 notify로 오는 패킷 수신
  */
-
 #include <Arduino.h>
 #include "bitchat_client.h"
 
 BitchatClient client;
-
 String input_buffer;
 
 void on_log(const char* msg) {
-    Serial.print("[bchat] ");
-    Serial.println(msg);
+    Serial.print("[bchat] "); Serial.println(msg);
 }
-
-void on_chat(const char* sender_id, const uint8_t* payload, size_t len) {
-    // payload를 문자열로 가정 (실제 구현에서는 암호화된 blob일 수 있음)
+void on_chat(const char* sender, const uint8_t* payload, size_t len) {
     String text;
-    text.reserve(len);
     for (size_t i = 0; i < len; ++i) {
-        if (payload[i] >= 32 && payload[i] < 127) {
-            text += (char)payload[i];
-        } else {
-            char hex[4];
-            snprintf(hex, sizeof(hex), "\\x%02x", payload[i]);
-            text += hex;
-        }
+        if (payload[i] >= 32 && payload[i] < 127) text += (char)payload[i];
     }
-    Serial.printf("\n[RECV from %s] %s\n> ", sender_id, text.c_str());
-}
-
-void on_peer(const char* peer_id) {
-    Serial.printf("\n[PEER] discovered: %s\n> ", peer_id);
+    Serial.printf("\n[RECV from %s] %s\n> ", sender, text.c_str());
 }
 
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println();
-    Serial.println("=== bitchat-client send_message example ===");
+    Serial.println("\n=== bitchat-client (real protocol) ===");
 
-    // 콜백 등록
     client.on_log(on_log);
-    client.on_chat_message(on_chat);
-    client.on_peer_discovered(on_peer);
+    client.on_chat(on_chat);
 
-    // 자체 키쌍 초기화 + BLE init
-    if (!client.begin("bchat-send")) {
+    if (!client.begin("bchat-cli")) {
         Serial.println("FATAL: begin() failed");
         while (true) { delay(1000); }
     }
-
     Serial.printf("My node ID: %s\n", client.get_node_id().c_str());
 
-    // relay 노드에 연결 (10초 타임아웃)
-    Serial.println("Connecting to bitchat relay...");
+    Serial.println("Connecting to relay...");
     if (!client.connect_to_relay(10000)) {
-        Serial.println("FATAL: no relay found in 10s. "
-                       "Make sure bitchat-esp32-relay is running nearby.");
+        Serial.println("No relay found. Make sure bitchat-esp32-relay is running.");
         while (true) { delay(1000); }
     }
 
-    Serial.println("Connected! Type a message + Enter to send.");
+    // ANNOUNCE 전송 (relay가 Ed25519 pk 추출하여 서명 검증에 사용)
+    client.send_announce("arduino-cli");
+    Serial.println("ANNOUNCE sent. Type message + Enter to send.");
     Serial.print("> ");
 }
 
 void loop() {
     client.loop();
-
-    // 시리얼 입력 처리
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\r' || c == '\n') {
             if (input_buffer.length() > 0) {
                 Serial.println();
                 Serial.printf("Sending: %s\n", input_buffer.c_str());
-                if (client.send_chat(input_buffer)) {
-                    Serial.println("OK");
-                } else {
-                    Serial.println("FAIL");
-                }
+                if (client.send_message(input_buffer)) Serial.println("OK");
+                else Serial.println("FAIL");
                 input_buffer = "";
                 Serial.print("> ");
             }
         } else if (input_buffer.length() < 200) {
             input_buffer += c;
-            Serial.write(c);   // echo
+            Serial.write(c);
         }
     }
 }
